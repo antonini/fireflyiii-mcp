@@ -43,7 +43,8 @@ export function defineTool(
         content: [
           {
             type: 'text' as const,
-            text: typeof result === 'string' ? result : JSON.stringify(result, null, 2),
+            // Compact: indentation adds roughly a third more tokens to every result for no gain to the model.
+            text: typeof result === 'string' ? result : JSON.stringify(result),
           },
         ],
       };
@@ -110,16 +111,26 @@ export const dateOrDateTimeSchema = z
   });
 
 /**
- * Extracts a leading numeric ID from an autocomplete label such as `"42 (Checking - asset)"`.
+ * A numeric Firefly III ID that ends up in a URL path. Validating it here is what stops a value like
+ * `../budgets/5` (which `new URL()` would resolve to a different resource) from reaching a request.
+ * `FireflyClient` refuses such paths as well; this check gives the model a clear message first.
+ */
+export const idSchema = z.string().regex(/^\d+$/, 'Must be a numeric Firefly III ID');
+
+/**
+ * Extracts the leading numeric ID from an autocomplete label such as `"42 (Checking - asset)"`, or
+ * returns a plain numeric ID unchanged.
  *
- * This relies on the completion-label format (the numeric ID always comes first). When the value
- * has no leading digits it is returned unchanged. Note that a free-typed value like `"42 Main St"`
- * would resolve to `"42"`, so callers should prefer values picked from autocomplete suggestions
- * rather than arbitrary user input.
+ * Relies on the completion-label format (the numeric ID always comes first). A free-typed value like
+ * `"42 Main St"` resolves to `"42"`, so callers should prefer values picked from autocomplete
+ * suggestions. A value with no leading number is rejected rather than passed through: it would end up
+ * verbatim in a URL path.
  */
 export function parseId(id: string): string {
   const match = id.match(/^(\d+)/);
-  return match ? match[1] : id;
+  if (!match)
+    throw new Error(`"${id}" is not a valid ID: expected a number, or an autocomplete label that starts with one.`);
+  return match[1];
 }
 
 /**
@@ -172,14 +183,27 @@ export interface TtlCache<T> {
   get(key: string, fetchFn: () => Promise<T>): Promise<T>;
   /** Drops all cached entries. */
   clear(): void;
+  /** Number of entries currently held (fresh or not yet swept). */
+  size(): number;
 }
+
+// Upper bound on distinct identities a cache holds at once. Every refreshed OAuth access token is a
+// new identity, so without a bound (and without sweeping expired entries) a long-running HTTP server
+// accumulated one stale entry, of up to AUTOCOMPLETE_FETCH_LIMIT records, per token it ever saw.
+const AUTOCOMPLETE_CACHE_MAX_ENTRIES = 256;
 
 /**
  * Creates a module-scoped TTL cache keyed by an opaque identity string. The key MUST scope entries
  * per authenticated user (e.g. a hash of the bearer token): in HTTP mode a single client instance
  * serves every request, so an unkeyed cache would leak one user's data to another.
+ *
+ * Expired entries are swept whenever a new one is stored, and at most `maxEntries` are kept (the
+ * least recently stored is dropped first), so memory stays bounded however many identities pass.
  */
-export function createTtlCache<T>(ttlMs = AUTOCOMPLETE_CACHE_TTL_MS): TtlCache<T> {
+export function createTtlCache<T>(
+  ttlMs = AUTOCOMPLETE_CACHE_TTL_MS,
+  maxEntries = AUTOCOMPLETE_CACHE_MAX_ENTRIES,
+): TtlCache<T> {
   const entries = new Map<string, CacheEntry<T>>();
   return {
     get(key: string, fetchFn: () => Promise<T>): Promise<T> {
@@ -191,11 +215,25 @@ export function createTtlCache<T>(ttlMs = AUTOCOMPLETE_CACHE_TTL_MS): TtlCache<T
         if (entries.get(key)?.promise === promise) entries.delete(key);
         throw err;
       });
+      for (const [k, entry] of entries) {
+        if (now - entry.fetchedAt > ttlMs) entries.delete(k);
+      }
+      // Re-inserting moves the key to the end of the Map's insertion order, which is what the
+      // oldest-first eviction below relies on.
+      entries.delete(key);
+      while (entries.size >= maxEntries) {
+        const oldest = entries.keys().next().value;
+        if (oldest === undefined) break;
+        entries.delete(oldest);
+      }
       entries.set(key, { promise, fetchedAt: now });
       return promise;
     },
     clear(): void {
       entries.clear();
+    },
+    size(): number {
+      return entries.size;
     },
   };
 }

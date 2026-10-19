@@ -6,7 +6,7 @@
 
 Users can query their finances in natural language through Claude, getting answers about accounts, transactions, budgets, categories, bills, piggy banks, and financial insights without writing queries themselves.
 
-**Current state:** 140 tools across 14 groups, full CRUD, stdio and HTTP (OAuth or PAT) transports, tool filtering via `--preset`/`--groups`/`--read-only`.
+**Current state:** 137 tools across 14 groups, full CRUD, stdio and HTTP (OAuth or PAT) transports, tool filtering via `--preset`/`--groups`/`--read-only`.
 
 ### Architecture at a glance
 
@@ -26,7 +26,7 @@ MCP client (Claude Code / Desktop / ...)
                      │  registerAllTools (src/tools/index.ts)
                      │  · TOOL_GROUPS / PRESETS filtering, read-only proxy
                      ▼
-      Tool groups (src/tools/*.ts, 14 groups / 140 tools)
+      Tool groups (src/tools/*.ts, 14 groups / 137 tools)
         · defineTool wrapper: zod validation, error formatting (src/tools/_helpers.ts)
         · autocomplete prompts with per-user TTL cache
                      │
@@ -83,7 +83,7 @@ FIREFLY_DEBUG     Set to "true" or "1" to emit verbose autocomplete tracing to s
 ```
 MCP_PRESET      String. Named preset; same values as --preset. Mutually exclusive with MCP_GROUPS.
 MCP_GROUPS      String. Comma-separated group names; same values as --groups. Empty/whitespace-only is treated as unset.
-MCP_READ_ONLY   "true" or "1" (case-insensitive, trimmed) enables read-only mode; any other value is ignored.
+MCP_READ_ONLY   "true" or "1" (case-insensitive, trimmed) enables read-only mode; "false", "0" or empty leave it off; any other value is an error.
 ```
 
 Store credentials in `.env` file (which is gitignored). The `.env.example` template shows what's needed.
@@ -101,7 +101,9 @@ Parsed by `src/args.ts` and passed to `createServer` as `filterOptions`.
 | `--port <n>` | `3000` | Listen port (HTTP only; auto-increments on EADDRINUSE) |
 | `--preset <name>` | — | Load a named tool subset (see Filtering) |
 | `--groups <list>` | — | Comma-separated group names; cannot combine with `--preset` |
-| `--read-only` | false | Filter any selection to read-only tools (`get_*`, `search_*`, `test_*`) |
+| `--read-only` | false | Filter any selection to tools annotated `readOnlyHint: true` |
+
+Unknown flags, value flags without a value, a non-numeric `--port`, an empty `--groups` and inherited property names as presets (`toString`) are all errors. Value flags also accept `--flag=value`.
 
 ---
 
@@ -131,7 +133,7 @@ fireflyiii-mcp/
 │   │   ├── attachments.ts       # get_attachments, get_attachment, create_attachment, update_attachment, delete_attachment, upload_attachment, download_attachment
 │   │   ├── currencies.ts        # get_currencies, get_currency, create_currency, update_currency, delete_currency, enable_currency, disable_currency, set_primary_currency
 │   │   ├── exports.ts           # export_transactions, export_accounts, export_bills, export_budgets, export_categories, export_tags, export_recurring, export_rules, export_piggy_banks
-│   │   ├── object-groups.ts     # get_object_groups, get_object_group, create_object_group, update_object_group, delete_object_group, get_object_group_bills, get_object_group_piggy_banks
+│   │   ├── object-groups.ts     # get_object_groups, get_object_group, update_object_group, delete_object_group, get_object_group_bills, get_object_group_piggy_banks
 │   │   └── transaction-links.ts # get_link_types, get_transaction_links, get_transaction_link, create_transaction_link, update_transaction_link, delete_transaction_link
 │   └── tests/
 │       ├── accounts.test.ts
@@ -192,14 +194,14 @@ rules, recurring, attachments, currencies, exports, object-groups, transaction-l
 |------|--------|-------|
 | `minimal` | accounts, transactions | 15 |
 | `default` | accounts, transactions, budgets, categories, bills | 37 |
-| `budgeting` | accounts, transactions, budgets, categories, bills, piggy-banks | 44 |
+| `budgeting` | accounts, transactions, budgets, categories, bills, piggy-banks | 42 |
 | `insights` | accounts, transactions, categories, reports | 57 |
 | `automation` | accounts, transactions, rules, recurring | 37 |
-| `full` | all 14 groups | 140 |
+| `full` | all 14 groups | 137 |
 
 ### Read-only proxy
 
-`makeReadOnlyProxy(server)` wraps the `McpServer` with a `Proxy` that silently drops any `registerTool` call whose name does not start with `get_`, `search_`, or `test_`. Applied when `--read-only` is passed.
+`makeReadOnlyProxy(server)` wraps the `McpServer` with a `Proxy` that silently drops any `registerTool` call whose config is not annotated `readOnlyHint: true`. A test in `tool-filter.test.ts` keeps names and annotations consistent (`get_`/`search_`/`test_`/`export_`/`download_` tools are read-only, nothing else is). Applied when `--read-only` is passed.
 
 ---
 
@@ -378,7 +380,9 @@ Routes handled by the proxy (no auth required):
 - `POST /oauth/token` — substitutes `redirect_uri` back to our stable callback, proxies token exchange to Firefly III (30 s AbortController timeout)
 - `GET /oauth/callback` — receives Firefly III's redirect, forwards `code`+`state` to the MCP client's original dynamic callback URL
 
-All other requests require a `Bearer` token in the `Authorization` header. The token is propagated via `AsyncLocalStorage` so `FireflyClient` can read it without it being passed through every call chain.
+All other requests require a `Bearer` token in the `Authorization` header.
+
+Every request body is read through `readBody(req, maxBytes)`: OAuth routes are capped at 64 KiB (`OAUTH_MAX_BODY_BYTES`) and MCP requests at 16 MiB (`MCP_MAX_BODY_BYTES`, read by `createMcpRequestHandler` and handed to the SDK pre-parsed, because the SDK buffers without a limit). Over-limit requests get `413` with `Connection: close`. Pending OAuth flows are capped at `MAX_PENDING_FLOWS` (1,000, oldest dropped first). The token is propagated via `AsyncLocalStorage` so `FireflyClient` can read it without it being passed through every call chain.
 
 **Limitation:** OAuth state lives in-process — single replica only. Horizontal scaling breaks the auth flow.
 
@@ -455,7 +459,8 @@ expect(result).toEqual({ name: 'Checking', current_balance: '1000', id: '1' });
 
 - **Unit tests** in `src/tests/` test fetch functions in isolation (mock `client.get`).
 - Fixtures use **realistic JSON:API envelopes** — the full `{ data: [{ id, type, attributes, links }], meta: { pagination } }` shape — so tests catch transform regressions.
-- **Integration tests** in `src/tests/integration.test.ts` run against a real Firefly III instance (only when `FIREFLY_INTEGRATION=true`).
+- **Contract test** in `src/tests/firefly-contract.test.ts` calls every tool against a recording client and checks each request's method and path against snapshots of Firefly III's route table (`src/tests/fixtures/firefly-routes-<tag>.json`, one for the oldest supported release and one for the newest tested). Mocked unit tests cannot catch a path Firefly does not serve; this one does. Refresh or add a snapshot with `node scripts/update-firefly-routes.mjs vX.Y.Z`, and keep the oldest snapshot equal to the minimum version stated in the docs (currently **v6.4.0**).
+- **Integration tests** in `src/tests/integration.test.ts` run against a real Firefly III instance (only when `FIREFLY_INTEGRATION=true`). Request *bodies* are only verified here, so any tool whose payload shape is non-obvious (split transactions, piggy bank accounts, insight filters) should get a live test. Everything a test creates must be deleted in `afterAll`: contributors run this suite against their own instance.
 - Run unit tests in CI; integration tests manually or in a staging environment.
 
 ---
@@ -480,7 +485,7 @@ Routine dependency-CVE fixes ship with no human in the loop:
    - The changelog bullet is **line 3 of the merge commit** — the merged PR's title, because the repo's `merge_commit_message` setting is `PR_TITLE`. If that setting is ever changed, the workflow fails loudly (a guard rejects any line 3 that is not a `chore(deps…` subject) instead of shipping a `Merge pull request #N` bullet. Fixing it means restoring the setting, not editing the workflow.
 4. The tag push runs `publish.yml`'s normal release path (npm `latest`, Docker semver/`latest`, GitHub Release).
 
-Manual (non-Dependabot) hotfixes: PR to `main`, merge, then cut the release manually per "Releasing a New Version" below — `auto-release.yml` only fires on Dependabot merges.
+Manual (non-Dependabot) hotfixes: PR to `main`, merge, then cut the release manually per "Hotfix releases" below — `auto-release.yml` only fires on Dependabot merges. Don't rely on Dependabot to catch every advisory: GitHub can publish a reviewed npm advisory without ever raising a Dependabot alert for a repo whose dependency graph lists the vulnerable version, and then no security PR is opened. The nightly `strict-audit` job is the backstop — when it goes red with no open Dependabot PR, fix it by hand as a hotfix to `main`.
 
 The PR audit check is **relative** (`scripts/audit-compare.sh`: no new moderate+ advisories vs the base branch) so a partial security fix stays mergeable; the strict absolute audit runs in `nightly.yml` and alerts without blocking.
 
@@ -504,6 +509,15 @@ The release branch also keeps `main` at **one push per release**. `backmerge.yml
 7. Create an annotated git tag on the resulting merge commit on `main`, with the `## [X.Y.Z]` block from `CHANGELOG.md` as its message (a git-native record of what shipped). The publish workflow validates that this section exists before publishing; it reads the version from the changelog, so tagging a merge commit rather than the release commit is fine.
 8. Push the tag: `git push origin v<version>` — this triggers the publish workflow, which validates the changelog, runs tests, publishes to npm + GHCR, and creates a GitHub Release whose notes are extracted from the matching `CHANGELOG.md` section.
 9. `backmerge.yml` merges the released section straight back into `develop`. `CHANGELOG.md`'s `merge=union` driver resolves the usual case automatically even if `develop` has already collected new `[Unreleased]` entries; a back-merge PR only appears if git still can't reconcile it, and that needs manual resolution. Delete the release branch once it's merged.
+
+### Hotfix releases
+
+A manual hotfix (a fix merged straight to `main`, typically a dependency CVE Dependabot didn't raise) ships through the same `release/X.Y.Z` → `main` PR and tag, with these differences:
+
+1. **Land the fix on `main` first** — a PR from a branch cut from `origin/main`, with its bullets under `## [Unreleased]` in `main`'s `CHANGELOG.md`. Change only what the fix needs: for a transitive dependency, update just the vulnerable lockfile entries (`npm update <pkg>`) rather than `npm audit fix`, which refreshes unrelated packages too.
+2. **Back-merge the fix before releasing.** If `develop`'s `[Unreleased]` already has a heading the fix adds (typically `### Security`), the union merge leaves two of them, `changelog-guard` rejects the result, and `backmerge.yml` opens a back-merge PR whose head is `main` — which can't be edited. Resolve it on a branch cut from `origin/develop`: `git merge --no-ff origin/main`, fold the bullets under `develop`'s existing heading, and PR that into `develop`. The automated PR is marked merged once `develop` contains `main`.
+3. **Cut the release branch from `main`, not `develop`** (`git checkout -b release/X.Y.Z origin/main`), so the release contains only the hotfix and none of `develop`'s unreleased work. Promote `main`'s `[Unreleased]` and bump the patch version as in steps 3–5 above, then PR, merge, tag and push the tag as in steps 6–8.
+4. **Expect the post-release back-merge to fail too** whenever `develop` has pending `[Unreleased]` entries: the union merge splices them into the section that just shipped, and the guard rejects the edit to a released section. Resolve it the same way as in step 2, but make the released `## [X.Y.Z]` section identical to the tag (`git show vX.Y.Z:CHANGELOG.md`), remove the bullets that just shipped from `develop`'s `[Unreleased]`, keep `develop`'s own pending entries there, and add the `[X.Y.Z]:` link reference. `node scripts/changelog-guard.mjs` must report the file consistent with the new tag before you push.
 
 ### Nightly builds
 
@@ -553,7 +567,8 @@ Use the correct developer attribution matching the model's originating company:
 ## Security & Open Source
 
 - **No hardcoded secrets.** All credentials come from environment variables.
-- **Validate all input.** Use Zod schemas defined inline in each `defineTool()` call.
+- **Validate all input.** Use Zod schemas defined inline in each `defineTool()` call. Any value that becomes part of a URL path must be validated: numeric IDs use `idSchema` (or `parseId` for autocomplete labels), other strings are `encodeURIComponent`-ed. `FireflyClient` also refuses any path with dot segments, `?`, `#`, backslashes or control characters (`assertSafeApiPath`), because `new URL()` would otherwise resolve `../` and point a request at another resource.
+- **Bound what reaches the model.** `download_attachment` and the `export_*` tools refuse results over their limits (`MAX_IMAGE_ATTACHMENT_BYTES` / `MAX_FILE_ATTACHMENT_BYTES`, `EXPORT_MAX_BYTES`) rather than returning them.
 - **Error handling.** Every tool handler wraps in try/catch and returns `{ isError: true }` on failure.
 - **Dependencies.** Keep them minimal and up-to-date.
 - **License.** MIT — include LICENSE file.
@@ -571,7 +586,10 @@ Use the correct developer attribution matching the model's originating company:
 - The MCP SDK handles serialization; just return plain objects from tool handlers (via the `defineTool` helper, which JSON-stringifies the result into a text block). For tools that must emit native content blocks instead — e.g. `download_attachment` returns an `image` block for image attachments — use `defineContentTool` and return a ready-made `{ content: [...] }` result.
 - Firefly III API is REST; pagination is via query params (`limit`, `page`).
 - `/summary/basic` returns a dict (`Record<string, {...}>`), not an array — use `cleanSummary`.
-- Insight endpoints (`/insight/expense/category`, `/insight/income/category`) return flat arrays with no JSON:API envelope — pass through directly.
+- Insight endpoints (`/insight/expense/category`, `/insight/income/category`) return flat arrays with no JSON:API envelope — pass through directly. Their account filters are only read from `accounts[]` (Firefly splits them by account type itself); any other parameter name is silently ignored.
+- **Transaction updates must name every split.** Firefly treats a `transactions[]` entry without `transaction_journal_id` as a new split and deletes every existing split the PUT does not mention, and `/search/transactions` returns *partial* groups (only the matching splits). Re-read the full group and send each split with its ID (`buildGroupUpdate` in `tools/transactions.ts`).
+- **Piggy bank `accounts` replace the linked set.** Any account left out of an update's `accounts` is unlinked along with the money saved from it, so `update_piggy_bank` merges the caller's entries over the current links.
+- The minimum supported Firefly III version is **v6.4.0** (the oldest release that serves every route the tools call).
 - `MCP_BASE_URL` must be set when the HTTP server is not on loopback (e.g. Docker); the server exits with code 1 otherwise.
 - **Internal planning docs (design specs, implementation plans) are local-only.** They live in `docs/superpowers/` (gitignored, and `srcExclude`d from the VitePress site) and must never be committed — do not create alternative locations like `docs/design/` for them.
 
